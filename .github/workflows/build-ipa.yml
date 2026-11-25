@@ -1,0 +1,106 @@
+name: Build unsigned IPA
+
+# Ручной запуск: вкладка Actions -> "Build unsigned IPA" -> Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      scheme:
+        description: "Xcode scheme"
+        default: "mobileLLM"
+        required: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install tooling
+        run: |
+          brew install xcodegen || true
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          xcodebuild -version
+
+      # Metal Toolchain нужен для MLX (в новых Xcode он ставится отдельно)
+      - name: Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      # llama.xcframework (~355 MB) в репозитории не хранится, собирается 15-25 мин.
+      # Кэшируем, чтобы последующие запуски были быстрыми.
+      - name: Restore llama.xcframework cache
+        id: llama-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: Packages/LLMEngineLlama/Vendor/llama.xcframework
+          key: llama-xcframework-${{ hashFiles('scripts/build-llama-xcframework.sh') }}
+
+      - name: Build llama.xcframework
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        run: |
+          chmod +x scripts/build-llama-xcframework.sh
+          ./scripts/build-llama-xcframework.sh
+
+      - name: Save llama.xcframework cache
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: Packages/LLMEngineLlama/Vendor/llama.xcframework
+          key: llama-xcframework-${{ hashFiles('scripts/build-llama-xcframework.sh') }}
+
+      - name: Signing.xcconfig (placeholder, подпись отключена)
+        run: |
+          [ -f Signing.xcconfig ] || cp Signing.xcconfig.example Signing.xcconfig
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Show schemes
+        run: xcodebuild -list -project mobileLLM.xcodeproj
+
+      - name: Archive (unsigned, iOS)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project mobileLLM.xcodeproj \
+            -scheme "${{ inputs.scheme }}" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/mobileLLM.xcarchive" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            | tee "$RUNNER_TEMP/build.log" | tail -n 200
+
+      - name: Package IPA
+        run: |
+          APP=$(find "$RUNNER_TEMP/mobileLLM.xcarchive/Products/Applications" -maxdepth 1 -name "*.app" | head -n 1)
+          echo "App: $APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out
+          zip -qry mobileLLM-unsigned.ipa Payload
+          ls -lh mobileLLM-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mobileLLM-unsigned-ipa
+          path: out/mobileLLM-unsigned.ipa
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
