@@ -66,10 +66,55 @@ jobs:
       - name: Show schemes
         run: xcodebuild -list -project mobileLLM.xcodeproj
 
-      # Диагностика: печатает определение, на котором компилятор спотыкается
-      - name: Show planningInstruction definition
+      # Патч: компилятор не справляется с огромной цепочкой строк через "+".
+      # Разбиваем её на отдельные присваивания (поведение не меняется).
+      - name: Patch AgentRuntimeAssembly.swift (split long string expression)
         run: |
-          grep -rn "planningInstruction" --include=*.swift . | head -n 20 || true
+          python3 - <<'PY'
+          import re, sys
+          path = "App/AgentRuntimeAssembly.swift"
+          src = open(path, encoding="utf-8").read()
+          pat = re.compile(
+              r"        let instruction = CollaborativeWorkflow\.planningInstruction\n.*?\n(?=        // Dynamic execution uses the same frozen authority)",
+              re.S)
+          NEW = r'''        let toolIDsText: String = tools.joined(separator: ", ")
+          let skillCatalogText: String = try CanonicalJSON(.array(availableSkills.map(\.catalogEntry))).string
+          let allowedModelsText: String = source.modelPolicy.allowedSelections.map { $0.modelID.rawValue }.joined(separator: ", ")
+          let reasoningText: String
+          if source.modelPolicy.localOnly || !snapshot.onlineReasoningEnabled {
+              reasoningText = "inherit only"
+          } else {
+              reasoningText = snapshot.onlineReasoningEffort?.rawValue ?? "service default"
+          }
+          let toolCallLimit: Int = executesCode ? 12 : 6
+          let toolInvocationLimit = workflowBudget.limits[.toolInvocations]
+          let modelAttemptLimit = workflowBudget.limits[.modelAttempts]
+          var instruction: String = CollaborativeWorkflow.planningInstruction
+          instruction += "\nWORKER TOOL IDS (host delegation remains available when this list is empty):\n"
+          instruction += toolIDsText
+          instruction += "\nACTUAL RUN DATE (UTC): "
+          instruction += date
+          instruction += "\nALLOWED SKILL CATALOG:\n"
+          instruction += skillCatalogText
+          instruction += "\nALLOWED MODELS: "
+          instruction += allowedModelsText
+          instruction += "\nMAXIMUM REASONING EFFORT: "
+          instruction += reasoningText
+          instruction += "\nFROZEN GOAL BUDGET: \(toolInvocationLimit) tool calls, \(modelAttemptLimit) model requests. Each activation may request at most \(toolCallLimit) tool calls. Reserve capacity for acceptance and final artifact delivery."
+          instruction += "\nORIGINAL GOAL:\n"
+          instruction += snapshot.text
+          '''
+          # YAML уже снял отступ блока; добавляем Swift-отступ в 8 пробелов (кроме первой строки)
+          lines = NEW.split("\n")
+          fixed = [lines[0]] + [("        " + l if l.strip() else l) for l in lines[1:]]
+          NEW = "\n".join(fixed)
+          new_src, n = pat.subn(lambda m: NEW, src, count=1)
+          if n != 1:
+              print("PATCH FAILED: pattern not found"); sys.exit(1)
+          open(path, "w", encoding="utf-8").write(new_src)
+          print("patched OK")
+          PY
+          sed -n '925,965p' App/AgentRuntimeAssembly.swift
 
       - name: Archive (unsigned, iOS)
         run: |
