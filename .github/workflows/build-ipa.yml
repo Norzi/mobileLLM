@@ -66,6 +66,11 @@ jobs:
       - name: Show schemes
         run: xcodebuild -list -project mobileLLM.xcodeproj
 
+      # Диагностика: печатает определение, на котором компилятор спотыкается
+      - name: Show planningInstruction definition
+        run: |
+          grep -rn "planningInstruction" --include=*.swift . | head -n 20 || true
+
       - name: Archive (unsigned, iOS)
         run: |
           set -o pipefail
@@ -81,7 +86,16 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
-            | tee "$RUNNER_TEMP/build.log" | tail -n 200
+            OTHER_SWIFT_FLAGS='$(inherited) -Xfrontend -solver-expression-time-threshold=3600 -Xfrontend -solver-memory-threshold -Xfrontend 3500000000 -Xfrontend -solver-scope-threshold -Xfrontend 200000000' \
+            > "$RUNNER_TEMP/build.log" 2>&1
+
+      - name: Show real errors
+        if: failure()
+        run: |
+          echo "=== error lines ==="
+          grep -nE "error:|fatal error|BUILD FAILED|ARCHIVE FAILED|Command .* failed|requires a minimum|Missing|not found" "$RUNNER_TEMP/build.log" | head -n 60 || true
+          echo "=== last 60 lines ==="
+          tail -n 60 "$RUNNER_TEMP/build.log"
 
       - name: Package IPA
         run: |
